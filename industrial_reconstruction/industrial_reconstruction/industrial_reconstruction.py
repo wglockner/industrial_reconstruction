@@ -150,12 +150,40 @@ class IndustrialReconstruction(Node):
         self.declare_parameter("depth_edge_threshold", 0.008)      # meters-per-pixel gradient
         self.declare_parameter("depth_edge_dilate", 1)             # pixels to dilate (0 = off)
         self.declare_parameter("depth_gradient_ksize", 3)          # 3 or 5 (Sobel kernel)
+        
+        # ---- Depth quality/confidence filtering params ----
+        self.declare_parameter("enable_quality_filter", True)      # Enable quality-based frame filtering
+        self.declare_parameter("min_quality_threshold", 0.5)        # Minimum overall quality score (0.0-1.0)
+        self.declare_parameter("min_coverage", 0.3)                 # Minimum valid depth pixel coverage (0.0-1.0)
+        self.declare_parameter("min_smoothness", 0.4)              # Minimum smoothness score (0.0-1.0)
+        self.declare_parameter("log_rejected_frames", True)         # Log frames rejected due to quality
 
         # Read manual edit parameters
         self.enable_external_edit = bool(self.get_parameter("enable_external_edit").value)
         self.editor_cmd = str(self.get_parameter("editor_cmd").value)
         self.external_edit_timeout_sec = int(self.get_parameter("external_edit_timeout_sec").value)
 
+        # Read quality filter parameters
+        self.enable_quality_filter = bool(self.get_parameter("enable_quality_filter").value)
+        self.min_quality_threshold = float(self.get_parameter("min_quality_threshold").value)
+        self.min_coverage = float(self.get_parameter("min_coverage").value)
+        self.min_smoothness = float(self.get_parameter("min_smoothness").value)
+        self.log_rejected_frames = bool(self.get_parameter("log_rejected_frames").value)
+        
+        # Quality filtering statistics
+        self.total_frames_received = 0
+        self.frames_accepted = 0
+        self.frames_rejected = 0
+        
+        # Import quality filter module
+        try:
+            from .depth_quality_filter import is_depth_frame_acceptable, calculate_depth_quality_score
+            self.quality_filter_available = True
+        except ImportError:
+            self.get_logger().warn("Quality filter module not available. Quality filtering disabled.")
+            self.enable_quality_filter = False
+            self.quality_filter_available = False
+        
         # Read auto pipeline parameters
         self.auto_filter_strategy = str(self.get_parameter("auto_filter_strategy").value).lower()
         self.auto_filter_cmd = str(self.get_parameter("auto_filter_cmd").value)
@@ -234,14 +262,16 @@ class IndustrialReconstruction(Node):
             SetBool, f"/{self.camera_name}/toggle_depth"
         )
         
-        # Wait for camera services to be available and disable streams initially
+        # Wait for camera services to be available
+        # NOTE: Disabled initial stream disabling as it causes camera crashes during initialization
+        # Streams will be controlled via start/stop reconstruction services instead
         self.get_logger().info(f"Waiting for camera services /{self.camera_name}/toggle_color and /{self.camera_name}/toggle_depth...")
         color_ready = self.toggle_color_client.wait_for_service(timeout_sec=10.0)
         depth_ready = self.toggle_depth_client.wait_for_service(timeout_sec=10.0)
         
         if color_ready and depth_ready:
-            self.get_logger().info("Camera services available, disabling streams initially")
-            self._control_camera_streams(False)
+            self.get_logger().info("Camera services available. Stream control will be available for start/stop reconstruction.")
+            # Don't disable streams initially - let camera run normally and control via services
         else:
             self.get_logger().warn(f"Camera services not available. Stream control will be disabled.")
 
@@ -868,6 +898,16 @@ class IndustrialReconstruction(Node):
                 self.sensor_data.clear()
                 self.tsdf_integration_data.clear()
 
+                # Log quality filter statistics
+                if self.enable_quality_filter and self.total_frames_received > 0:
+                    rejection_rate = (self.frames_rejected / self.total_frames_received) * 100.0
+                    self.get_logger().info(
+                        f"Quality filter statistics: "
+                        f"Total={self.total_frames_received}, "
+                        f"Accepted={self.frames_accepted}, "
+                        f"Rejected={self.frames_rejected} ({rejection_rate:.1f}%)"
+                    )
+
                 self.tsdf_volume = None
                 self.crop_box = None
                 self.crop_mesh = False
@@ -878,6 +918,16 @@ class IndustrialReconstruction(Node):
                 return res
             else:
                 # No archive; return success now
+                # Log quality filter statistics even if no archive
+                if self.enable_quality_filter and self.total_frames_received > 0:
+                    rejection_rate = (self.frames_rejected / self.total_frames_received) * 100.0
+                    self.get_logger().info(
+                        f"Quality filter statistics: "
+                        f"Total={self.total_frames_received}, "
+                        f"Accepted={self.frames_accepted}, "
+                        f"Rejected={self.frames_rejected} ({rejection_rate:.1f}%)"
+                    )
+                
                 res.success = True
                 res.message = f"Mesh Saved to {target_mesh}"
                 return res
@@ -899,6 +949,35 @@ class IndustrialReconstruction(Node):
                 if depth_u16.size == 0:
                     return
 
+                # --- Quality/Confidence Filtering (before processing) ---
+                self.total_frames_received += 1
+                frame_quality_acceptable = True
+                quality_score = 1.0
+                quality_metrics = {}
+                
+                if self.enable_quality_filter and self.quality_filter_available:
+                    from .depth_quality_filter import is_depth_frame_acceptable, calculate_depth_quality_score
+                    
+                    # Check frame quality before processing
+                    frame_quality_acceptable, quality_score, quality_metrics = is_depth_frame_acceptable(
+                        depth_u16,
+                        min_quality_threshold=self.min_quality_threshold,
+                        min_coverage=self.min_coverage,
+                        min_smoothness=self.min_smoothness
+                    )
+                    
+                    if not frame_quality_acceptable:
+                        self.frames_rejected += 1
+                        if self.log_rejected_frames:
+                            self.get_logger().warn(
+                                f"Frame rejected: quality={quality_score:.3f}, "
+                                f"coverage={quality_metrics['coverage']:.3f}, "
+                                f"smoothness={quality_metrics['smoothness']:.3f}"
+                            )
+                        return  # Skip this frame
+                
+                self.frames_accepted += 1
+                
                 # --- Depth denoise with bilateral on float32 meters ---
                 depth_f32 = depth_u16.astype(np.float32) / float(self.depth_scale)
 
